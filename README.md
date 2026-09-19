@@ -25,6 +25,20 @@ pip install fuzzyif
 
 No runtime dependencies; standard library only. Python 3.10+.
 
+## Does it work on real code?
+
+Two well-known projects, patched by script, judged by their own test suites.
+
+| project | what the `if` ladder decided | before → after | project's own tests |
+|---|---|---|---|
+| [Ansible](examples/ansible_distribution/) | which of 52 Linux distributions this host is, from `/etc/*-release` files | 786 → 450 lines, 84 `if`/`elif` removed, 2 `fuzzy_match` calls added | 65 / 90 fixtures pass; `distribution` 90 / 90, `os_family` 89 / 90. The 25 failures are version-string extraction conventions, which fuzzy-if does not try to do |
+| [Django](examples/django_cleanse_setting/) | which settings and headers to redact on the debug 500 page | one substring regex → one question | 109 / 110 pass; the one failure asserts `API_URL` must be redacted |
+
+The lesson from both: fuzzy-if replaces the `if` ladder that decides *what
+something is*. It does not replace the code that extracts a substring, and it
+should not be put in front of anything you would not send to an API (passwords,
+personal data).
+
 ## API key
 
 Resolved in this order:
