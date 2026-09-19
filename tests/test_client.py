@@ -24,7 +24,17 @@ def test_success(fake_conn):
     method, url, body, headers = h["conn"].requests[0]
     assert method == "POST" and url == "/v1/systemone"
     assert headers["Authorization"] == "Bearer k"
-    assert '"state": "text"' in body
+    assert isinstance(body, bytes)
+    assert b'"state": "text"' in body
+
+
+def test_non_ascii_state_is_sent_as_utf8(fake_conn):
+    build, h = fake_conn
+    c = make_client(build([("ok", 200, OK, {})]))
+    c.ask("\u30b5\u30fc\u30d0\u30fc\u304c\u843d\u3061\u305f \u12a0\u1295\u12f5", Q)  # Japanese + Amharic
+    body = h["conn"].requests[0][2]
+    assert isinstance(body, bytes)
+    assert "\u30b5\u30fc\u30d0\u30fc" in body.decode("utf-8")
 
 
 def test_reuses_connection(fake_conn):

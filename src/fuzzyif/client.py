@@ -59,14 +59,14 @@ class JevClient:
 
     # one round trip
 
-    def _send(self, body: str) -> tuple[int, str, str | None]:
+    def _send(self, body: bytes) -> tuple[int, str, str | None]:
         conn = self._conn()
         conn.request("POST", _PATH, body=body, headers=self._headers)
         resp = conn.getresponse()
         data = resp.read().decode("utf-8", errors="replace")
         return resp.status, data, resp.getheader("Retry-After")
 
-    def _send_reconnecting(self, body: str) -> tuple[int, str, str | None]:
+    def _send_reconnecting(self, body: bytes) -> tuple[int, str, str | None]:
         try:
             return self._send(body)
         except _RECONNECT:
@@ -78,7 +78,10 @@ class JevClient:
 
     def ask(self, state: str, questions: dict[str, dict]) -> dict[str, dict]:
         """POST the questions about `state` and return Jev's `answers` dict."""
-        body = json.dumps({"state": state, "model": self.settings.model, "questions": questions}, ensure_ascii=False)
+        # http.client only accepts str bodies that fit in latin-1; encode to UTF-8 bytes ourselves.
+        body = json.dumps(
+            {"state": state, "model": self.settings.model, "questions": questions}, ensure_ascii=False
+        ).encode("utf-8")
         max_attempts = max(1, self.settings.max_retries)
         attempts = 0
         while True:

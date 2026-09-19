@@ -20,7 +20,7 @@ kind = fuzzy_match(msg, {
 ## Install
 
 ```bash
-pip install -e .
+pip install fuzzyif
 ```
 
 No runtime dependencies; standard library only. Python 3.10+.
