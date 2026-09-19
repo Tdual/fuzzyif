@@ -10,38 +10,33 @@ contents. A hand-maintained `OS_FAMILY_MAP` then maps the name to a family.
 
 This example deletes that pile and asks two questions instead.
 
-## The change
+## Before
 
-| | before | after |
-|---|---|---|
-| `distribution.py` | 786 lines | 450 lines |
-| removed | `process_dist_files`, 13 `parse_distribution_file_*` methods, `OS_FAMILY_MAP` (402 lines, 84 `if`/`elif`) | |
-| added | | two `fuzzy_match` calls plus two label dictionaries (~60 lines) |
+![Before](../../docs/images/ansible_before.png)
 
-```python
-def process_dist_files(self):
-    facts = self._guess_distribution()            # version / codename from the `distro` library, as before
-    evidence = []
-    for ddict in self.OSDIST_LIST:                # the same file list Ansible already has
-        has_file, content = self._get_dist_file_content(ddict['path'], allow_empty=ddict.get('allowempty', False))
-        if has_file:
-            evidence.append("== %s ==\n%s" % (ddict['path'], (content or '').strip() or '(empty file)'))
-    if not evidence:
-        return facts
-    evidence.append("== python 'distro' library ==\nid=%r version=%r codename=%r" % (...))
-    facts['distribution'] = fuzzy_match("\n".join(evidence), DISTRIBUTION_LABELS)
-    return facts
-```
+## After
+
+![After](../../docs/images/ansible_after.png)
 
 ```python
 distribution_facts['os_family'] = fuzzy_match(evidence_with_name, OS_FAMILY_LABELS)
 ```
 
-`DISTRIBUTION_LABELS` is the list of names Ansible documents on its
-*Conditionals* page, with a one-line description each. Where Ansible keeps two
-labels for one operating system (`CoreOS` vs `Coreos`, `SLES` vs `SLES_SAP`,
-`UnionTech` vs `Uos`) the description spells out Ansible's convention.
-`patch_ansible.py` applies and reverts the edit.
+`DISTRIBUTION_LABELS` lists the names Ansible documents on its *Conditionals*
+page with a one-line description each. Where Ansible keeps two labels for one
+operating system (`CoreOS` vs `Coreos`, `SLES` vs `SLES_SAP`, `UnionTech` vs
+`Uos`) the description spells out Ansible's convention. `patch_ansible.py`
+applies and reverts the edit.
+
+## Size
+
+| | Before | After |
+|---|---|---|
+| `distribution.py` | 786 lines | 450 lines |
+| `if` / `elif` in the detection code | 84 | 0 |
+| parser methods | 13 | 0 |
+| name → family table | 70 entries | none |
+| lines added | | 2 `fuzzy_match` calls, 2 label dictionaries (about 60 lines) |
 
 ## Ansible's own tests
 
@@ -49,38 +44,38 @@ labels for one operating system (`CoreOS` vs `Coreos`, `SLES` vs `SLES_SAP`,
 feeds 90 recorded fixtures (real `/etc/*-release` contents from 52 distributions)
 through the collector and compares every reported key.
 
-| | before | after |
-|---|---|---|
-| fixtures | 90 | 90 |
-| passed | 90 | 65 |
-| failed | 0 | 25 |
-| wall time | 0.1 s | 47 s (180 Jev calls, no cache) |
-
-What the two questions were asked to decide:
-
-| key | agreement |
+| Result key | Agreement |
 |---|---|
-| `distribution` (which distro) | 90 / 90 |
-| `os_family` | 89 / 90 |
+| `distribution` | 90 / 90 |
+| `os_family` | 87 / 88 |
+| `distribution_version` | 88 / 90 |
+| `distribution_major_version` | 84 / 84 |
+| `distribution_cpe_name` | 20 / 20 |
+| `distribution_release` | 68 / 88 |
+| `distribution_minor_version` | 0 / 3 |
 
-The one `os_family` miss is `Uos 20`: Ansible labels the same UnionTech OS as
-`Uos` (Debian family) or `UnionTech` (RedHat family) depending on which release
-files are present. The judge picked the other one.
-
-What the 25 failing fixtures are actually about:
-
-| failing key | count | what Ansible's parsers were doing |
+| Fixtures | Before | After |
 |---|---|---|
-| `distribution_release` | 21 | SUSE: put the service-pack number in `release` (`15-SP6` → `6`); openSUSE Leap: the minor digit (`15.1` → `1`); Clear Linux: the literal `clear-linux-os`; CentOS: `Stream`; Devuan: the codename from `/etc/devuan_version`; Cumulus: the whole `DISTRIB_DESCRIPTION` |
+| all keys match | 90 | 65 |
+| any key differs | 0 | 25 |
+| wall time | 0.1 s | 47 s (180 Jev calls, cold cache) |
+
+## What the 25 differences are
+
+26 key mismatches across 25 fixtures.
+
+| Key | Count | Convention the deleted parser implemented |
+|---|---|---|
+| `distribution_release` | 20 | SUSE: the service-pack number (`15-SP6` → `6`); openSUSE Leap: the minor digit (`15.1` → `1`); Clear Linux: the literal `clear-linux-os`; CentOS: `Stream`; Devuan: the codename from `/etc/devuan_version`; Cumulus: the whole `DISTRIB_DESCRIPTION` |
 | `distribution_minor_version` | 3 | Debian and Amazon parsers add a key the `distro` baseline does not |
-| `distribution_version` | 1 | OSMC: `March 2022` read from a custom file |
-| `os_family` | 1 | the `Uos` / `UnionTech` label pair above |
+| `distribution_version` | 2 | OSMC: `March 2022` read from a custom file; SLES 11.3: patch level from `/etc/SuSE-release` |
+| `os_family` | 1 | Ansible labels the same UnionTech OS `Uos` (Debian family) or `UnionTech` (RedHat family) depending on which release files exist; the judge picked the other one |
 
 None of these is a judgement. They are string-extraction conventions, and the
-fuzzy version deliberately does not try to reproduce them: it keeps whatever the
-`distro` library reports for version and codename. That is the boundary this
-example is meant to show. **fuzzy-if replaces the `if` ladder that decides what
-something is. It does not replace the code that cuts a substring out of a file.**
+fuzzy version deliberately does not reproduce them: it keeps whatever the
+`distro` library reports for version and codename. **fuzzy-if replaces the `if`
+ladder that decides what something is. It does not replace the code that cuts a
+substring out of a file.**
 
 ## Reproduce
 
@@ -95,3 +90,6 @@ python /path/to/fuzzyif/examples/ansible_distribution/patch_ansible.py . --resto
 Ansible `main` (2.23.0.dev0) requires Python 3.13; on 3.12 add
 `--ignore-requires-python` to the install command, which is what the numbers
 above were produced with.
+
+The images were rendered from the deleted and added code with Pygments; the
+sources are `code_before.py` and `code_after.py` next to this file.
