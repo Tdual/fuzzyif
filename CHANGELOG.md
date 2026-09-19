@@ -9,7 +9,6 @@ All notable changes to this project are documented here. The format follows
 ### Added
 
 - `examples/ansible_distribution`: Ansible's distribution detection replaced by two `fuzzy_match` calls, scored with Ansible's own 90 fixtures.
-- `examples/django_cleanse_setting`: Django's secret-setting regex replaced by one question.
 - GitHub Actions: tests on 3.10-3.13, PyPI Trusted Publishing on `v*` tags.
 
 ### Fixed
