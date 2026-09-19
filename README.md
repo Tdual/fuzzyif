@@ -90,7 +90,3 @@ fuzzyif.configure(model="jev-latest", timeout=10.0, cache_size=1024, max_retries
 ```
 
 `configure()` clears the cache.
-
-## Design
-
-See `docs/superpowers/specs/2026-09-19-fuzzyif-design.md`.
