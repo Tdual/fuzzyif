@@ -1,20 +1,30 @@
 # fuzzyif 設計書
 
 日付: 2026-09-19
-状態: ドラフト（批判的レビュー前）
+状態: v0.2（批判的レビュー反映済み）
 
 ## 1. 目的
 
 Python の `if` 文の条件に、自然言語の問いをそのまま書けるようにする。判定は TypeSafe AI の Jev（System One モデル）に委譲し、Jev が返す確率をしきい値で bool に落とす。
 
 ```python
-from fuzzyif import fuzzy
+from fuzzyif import fuzzy, fuzzy_match
 
 msg = "ログイン後に画面が真っ白になります"
 
-if fuzzy("これは不具合の報告か", msg):
+# 独立した Yes/No 判定
+if fuzzy("これは緊急か", msg):
+    notify_oncall(msg)
+
+# 排他的な分岐（API 1回で最も近いものを選ぶ）
+kind = fuzzy_match(msg, {
+    "bug":   "不具合の報告",
+    "howto": "使い方の質問",
+    "other": "その他",
+})
+if kind == "bug":
     create_bug_ticket(msg)
-elif fuzzy("これは使い方の質問か", msg):
+elif kind == "howto":
     reply_faq(msg)
 else:
     escalate(msg)
@@ -22,27 +32,40 @@ else:
 
 通常の `if` では書けない「意味に基づく分岐」を、Python の制御構文を変えずに書けるようにするのがゴール。
 
+### fuzzy と fuzzy_match の使い分け（重要）
+
+`fuzzy()` は Jev の noul 型で「この問いに Yes か」を独立に答える。複数の `fuzzy()` を `if / elif` で並べても、各問いは互いを知らないので排他的にならない。実測では「パスワードを変更したいのですができません」に対し「不具合か」0.76、「使い方の質問か」0.89 と両方がしきい値を超え、先に書いた分岐が勝ってしまう。
+
+「どれか1つに分類したい」ときは `fuzzy_match()` を使う。Jev の choice 型で全選択肢を同時に比較し、最も確からしいものを返す。API 呼び出しも1回で済む。
+
+| 用途 | 使う関数 |
+|---|---|
+| Yes/No を1つ判定 | `fuzzy()` |
+| 複数の Yes/No を独立に判定 | `fuzzy_batch()` |
+| 選択肢から1つに分類 | `fuzzy_match()` |
+| 段階で評価 | `fuzzy_score()` |
+
 ## 2. スコープ
 
-### 初版（v0.1）に含める
+### v0.2 に含める
 
-- `fuzzy(question, text, threshold=0.5) -> bool`
-- `prob(question, text) -> float`（確率そのものが欲しいとき）
-- インメモリキャッシュ（同じ質問・テキストの組で API を叩き直さない）
-- Jev API クライアント（HTTP、認証、エラー変換）
-- 設定（APIキーの読み込み順、タイムアウト、キャッシュサイズ）
-- テスト用のモック機構（API を叩かずに固定値を返す）
+- `fuzzy(question, text, threshold=0.5, default=None) -> bool`
+- `prob(question, text, default=None) -> float`
+- `fuzzy_batch(text, questions, default=None) -> list[float]`
+- `fuzzy_match(text, choices, default=None, with_probs=False) -> str | tuple[str, dict]`
+- `fuzzy_score(text, question, levels, default=None) -> float`
+- インメモリ LRU キャッシュ
+- Jev API クライアント（keep-alive、リトライ、例外変換）
+- 設定（API キー探索、タイムアウト、キャッシュサイズ）
+- テスト用モック
 - 型ヒントと docstring
 
-### 初版に含めない
+### 含めない
 
-- `fuzzy_match()` のような choice 型を使う分岐構文
-- 非同期 API（`async def`）
-- 永続キャッシュ（ディスク、Redis）
-- 既存 `if` 文の自動変換ツール（第9章で将来設計だけ書く）
+- 非同期 API
+- 永続キャッシュ
+- 既存 `if` 文の自動変換ツール（第10章で将来設計だけ書く）
 - Jev 以外のバックエンド
-
-YAGNI で削る。必要になったら足す。
 
 ## 3. 公開 API
 
@@ -50,58 +73,99 @@ YAGNI で削る。必要になったら足す。
 
 | 引数 | 型 | 意味 |
 |---|---|---|
-| `question` | str | 自然言語の Yes/No 質問。「〜か」で終わる形を推奨 |
-| `text` | str | 判定対象のテキスト |
-| `threshold` | float | この値以上なら True。0.0〜1.0。既定 0.5 |
-| `default` | bool または None | API 失敗時の戻り値。None なら例外を送出 |
+| `question` | str | Yes/No 質問。「〜か」で終わる形を推奨 |
+| `text` | str | 判定対象。空または空白のみなら `ValueError` |
+| `threshold` | float | この値以上なら True。0.0〜1.0 の範囲外は `ValueError`。既定 0.5 |
+| `default` | bool または None | API 失敗時の戻り値。None なら `APIError` を送出 |
 
-戻り値: `prob(question, text) >= threshold`。
+実装: `prob()` を呼び、`APIError` を捕まえて `default` が None でなければそれを返す。それ以外は `prob >= threshold`。
 
 ### 3.2 `prob(question, text, *, default=None) -> float`
 
-Jev の `noul` 型で質問し、確率を返す。`fuzzy()` はこの関数の薄いラッパー。
+Jev の noul 型で質問し、確率を返す。`default` は float または None。失敗時に `default` が None でなければそれを返し、None なら `APIError`。
 
-### 3.3 `configure(**kwargs)`
+### 3.3 `fuzzy_batch(text, questions, *, default=None) -> list[float]`
 
-プロセス全体の設定を上書きする。
+複数の Yes/No 質問を1リクエストで投げ、確率のリストを `questions` と同じ順で返す。`default` は float または None で、失敗時は全要素にその値を入れたリストを返す。
+
+キャッシュは質問ごとに個別に保存する。一部がキャッシュにあれば、残りだけをリクエストする。
+
+### 3.4 `fuzzy_match(text, choices, *, default=None, with_probs=False)`
+
+| 引数 | 型 | 意味 |
+|---|---|---|
+| `text` | str | 判定対象 |
+| `choices` | dict[str, str] | キー: 選択肢の識別子、値: その説明。2つ以上必須 |
+| `default` | str または None | 失敗時に返すキー。None なら `APIError`。`choices` にないキーは `ValueError` |
+| `with_probs` | bool | True なら `(選ばれたキー, {キー: 確率})` のタプルを返す |
+
+Jev の choice 型を使う。`instructions` は「次の選択肢のうち、このテキストに最も当てはまるものはどれか」を固定文で送る。
+
+### 3.5 `fuzzy_score(text, question, levels, *, default=None) -> float`
+
+| 引数 | 型 | 意味 |
+|---|---|---|
+| `question` | str | 何を測るか（例:「顧客の怒りの度合い」） |
+| `levels` | list[str] | 順序のある段階。先頭が 0。2つ以上必須 |
+| `default` | float または None | 失敗時の戻り値 |
+
+Jev の score 型を使い、期待値（0〜len(levels)-1 の小数）を返す。
+
+### 3.6 `configure(**kwargs)`
+
+プロセス全体の設定を上書きする。呼び出すとキャッシュを全クリアする。起動時に1回呼ぶ前提で、実行中に繰り返し呼ぶ用途は想定しない。
 
 | キー | 既定値 | 意味 |
 |---|---|---|
-| `api_key` | 後述の探索順 | TypeSafe API キー |
+| `api_key` | 探索順は第6章 | TypeSafe API キー |
 | `model` | `"jev-latest"` | モデル名 |
 | `timeout` | 10.0 | HTTP タイムアウト秒 |
-| `cache_size` | 1024 | LRU キャッシュのエントリ数。0 で無効 |
+| `cache_size` | 1024 | LRU のエントリ数。0 で無効 |
 | `base_url` | `https://api.typesafe.ai` | エンドポイント |
+| `max_retries` | 3 | リトライ回数 |
 
-### 3.4 `mock(mapping=None, *, default_prob=None)`
+### 3.7 `mock(mapping=None, *, default_prob=None)`
 
-コンテキストマネージャ。テストで API を叩かずに固定確率を返す。
+コンテキストマネージャ。有効中は API を叩かず、キャッシュも読まず書かない。
+
+`mapping` は質問文（`fuzzy_match` なら `choices` のキーをソートして `|` で連結した文字列、`fuzzy_score` なら question）から値への辞書。値は次のいずれか。
+
+- float: テキストに関係なくその確率
+- dict[str, float]: テキストから確率への辞書。該当なしなら `default_prob`
+- callable: `f(text) -> float`
+
+`fuzzy_match` の mock 値は選ばれるキー（str）またはテキストからキーへの辞書または callable。
+
+該当がなく `default_prob` も None なら `MockMissError`。
 
 ```python
-with fuzzyif.mock({"これは不具合の報告か": 0.9}):
-    assert fuzzy("これは不具合の報告か", "anything")
+with fuzzyif.mock({
+    "これは緊急か": {"サーバーが落ちた": 0.95, "来週の会議について": 0.1},
+    "bug|howto|other": lambda t: "bug" if "エラー" in t else "howto",
+}):
+    ...
 ```
 
-`mapping` は質問文から確率への辞書。該当がなく `default_prob` も None なら `MockMissError` を送出する（テストの取りこぼしを防ぐ）。
-
-### 3.5 例外
+### 3.8 例外
 
 | 例外 | 継承元 | 条件 |
 |---|---|---|
 | `FuzzyIfError` | Exception | 基底 |
 | `ConfigError` | FuzzyIfError | API キー未設定など |
-| `APIError` | FuzzyIfError | HTTP 4xx/5xx、タイムアウト、接続失敗。`status_code` と `body` 属性を持つ |
+| `APIError` | FuzzyIfError | リトライ後も失敗。`status_code`、`body`、`attempts` 属性を持つ |
 | `MockMissError` | FuzzyIfError | mock 中に未定義の質問が来た |
+
+`ValueError` は入力検証（空テキスト、範囲外のしきい値、選択肢1つ以下、`default` が `choices` にない）で送出し、`FuzzyIfError` の下には置かない。呼び出し側のバグなので API 失敗と区別する。
 
 ## 4. モジュール構成
 
 ```
 fuzzyif/
 ├── __init__.py      # 公開 API の再エクスポート
-├── core.py          # fuzzy, prob, configure
-├── client.py        # JevClient: HTTP 呼び出しと例外変換
-├── cache.py         # LRU キャッシュ（functools.lru_cache は使わない。configure で動的にサイズ変更するため）
-├── config.py        # Settings dataclass、APIキー探索
+├── core.py          # fuzzy, prob, fuzzy_batch, fuzzy_match, fuzzy_score, configure
+├── client.py        # JevClient: HTTP 呼び出し、keep-alive、リトライ、例外変換
+├── cache.py         # スレッドセーフな LRU キャッシュ
+├── config.py        # Settings dataclass、API キー探索
 ├── mock.py          # mock コンテキストマネージャ
 └── errors.py        # 例外定義
 ```
@@ -110,121 +174,131 @@ fuzzyif/
 
 ### 依存関係
 
-- 実行時依存: なし（標準ライブラリの `urllib.request` と `json` のみ）。`requests` や `httpx` を要求しない。
-- 開発時依存: `pytest`
-
-理由: 「if 文の代わり」に使うモジュールが重い依存を持つと導入の敷居が上がる。Jev の API は単純な POST 1本なので標準ライブラリで足りる。
+- 実行時: 標準ライブラリのみ（`http.client`、`json`、`threading`、`ssl`）
+- 開発時: `pytest`
 
 ## 5. データフロー
 
 ```
 fuzzy(q, t, threshold)
   └→ prob(q, t)
-       ├→ mock 有効?  → mapping から返す
+       ├→ 入力検証（t が空なら ValueError）
+       ├→ mock 有効?  → mapping から返す（キャッシュは触らない）
        ├→ cache hit?  → キャッシュから返す
-       └→ JevClient.noul(q, t)
-            ├→ POST /v1/systemone  {"state": t, "model": m, "questions": {"q": {"type":"noul","instructions": q}}}
-            ├→ レスポンス answers.q.noul を float で取り出す
-            └→ 例外変換（urllib.error → APIError）
+       └→ JevClient.ask({q: noul})
+            ├→ POST /v1/systemone（keep-alive 接続を再利用）
+            ├→ 失敗時はリトライ（第7章）
+            ├→ answers[q].noul を float で取り出す
+            └→ 例外変換 → APIError
        └→ cache に保存
-  └→ prob >= threshold
+  └→ prob >= threshold（APIError は default があれば吸収）
+
+fuzzy_match(t, choices)
+  └→ 同じ流れで JevClient.ask({"_match": choice})
+       └→ answers._match.choice と probabilities を返す
+
+fuzzy_batch(t, [q1..qn])
+  └→ キャッシュにない質問だけを1リクエストにまとめる
 ```
 
-キャッシュのキーは `(question, text)` のタプル。`threshold` はキーに含めない。同じ確率に別のしきい値を当てるときは API を叩き直さない。
+キャッシュのキーは `(kind, model, question_key, text)`。`kind` は `"noul"` / `"choice"` / `"score"`。`question_key` は noul なら質問文、choice なら `choices` を JSON 化した文字列、score なら question と levels を JSON 化した文字列。`threshold` は含めない。
 
 ## 6. API キーの探索順
 
-1. `configure(api_key=...)` で明示されたもの
+1. `configure(api_key=...)`
 2. 環境変数 `TYPESAFE_API_KEY`
 3. ファイル `~/.config/typesafe/api_key`（1行目を strip）
 
-いずれもなければ最初の `prob()` 呼び出し時に `ConfigError`。import 時には失敗させない（テストや静的解析で import だけしたいケースがあるため）。
+いずれもなければ最初の API 呼び出し時に `ConfigError`。import 時には失敗させない。
 
-## 7. エラー処理の方針
+## 7. HTTP クライアントとリトライ
 
-- API 失敗時、`default` が与えられていればそれを返す。ログに WARNING を出す（`logging.getLogger("fuzzyif")`）。
+- `http.client.HTTPSConnection` を1つ保持し、接続を再利用する。接続が切れていたら（`BadStatusLine`、`ConnectionResetError`、`RemoteDisconnected`）1回だけ再接続して再送する。これはリトライ回数に数えない。
+- リトライ対象: HTTP 429、5xx、タイムアウト、接続失敗。4xx（429 以外）は即 `APIError`。
+- バックオフ: 0.5秒、1秒、2秒（`max_retries=3` のとき）。429 で `Retry-After` ヘッダがあればそれに従う。
+- 全リトライ失敗で `APIError`。`attempts` に試行回数を入れる。
+- クライアントはスレッドごとに接続を持つ（`threading.local`）。プロセス間では共有しない。
+
+## 8. エラー処理の方針
+
+- API 失敗時、`default` が None でなければそれを返し、`logging.getLogger("fuzzyif")` に WARNING を出す。
 - `default` が None なら `APIError` を送出する。if 文の中で黙って False になるのは危険なので、既定は例外。
-- Jev のレスポンスに `answers[q].noul` がない、または float に変換できないときは `APIError` として扱う。
-- `threshold` が 0〜1 の範囲外なら `ValueError`（設定ミスは早く落とす）。
+- 否定形 `if not fuzzy(...)` で `default=False` を使うと、障害時に全件が True 側に流れる。ドキュメントで注意を書く。
+- レスポンスに期待するフィールドがない、または型が違うときは `APIError`。
+- 入力検証エラーは `ValueError`。
 
-## 8. テスト戦略
+## 9. テスト戦略
 
-- `client.py`: `urllib.request.urlopen` を monkeypatch して、正常レスポンス、4xx、5xx、タイムアウト、不正JSON の5系統。
-- `cache.py`: LRU の追い出し順、サイズ0で無効化。
-- `core.py`: threshold の境界値（ちょうど0.5 は True）、default の挙動、mock との組み合わせ。
-- `config.py`: キーの探索順。環境変数とファイルの両方があるとき環境変数が勝つ。
-- 実 API を叩く統合テストは `TYPESAFE_API_KEY` があるときだけ実行（`pytest.mark.skipif`）。
+- `client.py`: `http.client.HTTPSConnection` を差し替えて、正常、4xx、429（Retry-After あり/なし）、5xx、タイムアウト、接続切れからの再接続、不正 JSON。
+- `cache.py`: LRU の追い出し順、サイズ0、スレッドから同時アクセス、`configure()` でクリア。
+- `core.py`: threshold 境界（ちょうど 0.5 は True）、空テキスト、`default` の型ごとの挙動、`fuzzy_match` の `with_probs`、`fuzzy_batch` の部分キャッシュヒット。
+- `mock.py`: float / dict / callable の3形式、`MockMissError`、mock 中にキャッシュへ書かれないこと。
+- `config.py`: キーの探索順。
+- 実 API を叩く統合テストは `TYPESAFE_API_KEY` があるときだけ実行。
 
-## 9. 将来: if 文の自動変換ツール（fuzzyif-convert）
+## 10. 将来: if 文の自動変換ツール（fuzzyif-convert）
 
-初版には含めないが、モジュール設計はこれを見越している。
+v0.2 には含めない。
 
 ### 何をするか
 
-既存の Python ソースから「テキストに対する条件分岐」を見つけ、`fuzzy()` 呼び出しに書き換える提案を出す。
+既存の Python ソースから「テキストに対する条件分岐」を見つけ、`fuzzy()` / `fuzzy_match()` 呼び出しに書き換える提案を出す。書き換えは人が承認してから適用する。
 
 ```python
 # 変換前
-if "エラー" in msg or "動かない" in msg or "できない" in msg:
+if "エラー" in msg or "動かない" in msg:
     create_bug_ticket(msg)
+elif "使い方" in msg or "どうやって" in msg:
+    reply_faq(msg)
 
 # 変換後（提案）
-if fuzzy("これは不具合の報告か", msg):
+kind = fuzzy_match(msg, {"bug": "不具合の報告", "howto": "使い方の質問", "other": "その他"})
+if kind == "bug":
     create_bug_ticket(msg)
+elif kind == "howto":
+    reply_faq(msg)
 ```
 
 ### どう動くか
 
-1. `ast` でソースを解析し、`if` / `elif` の条件式を列挙する。
-2. 条件式が「文字列変数に対する `in`、`startswith`、`re.search`、`==` の組み合わせ」なら変換候補にする。数値比較や None チェックは対象外。
-3. 候補ごとに、条件式と前後のコード（関数名、コメント、分岐先の処理）を LLM（Claude）に渡して「この条件が意図している自然言語の問い」を生成させる。
-4. `fuzzy(<生成した問い>, <変数名>)` に置き換えた diff を出力する。書き換えは人が承認してから適用する（自動適用しない）。
+1. `ast` でソースを解析し、`if` / `elif` チェーンを列挙する。
+2. 条件式が「同じ変数に対する `in`、`startswith`、`re.search`、`==` の組み合わせ」なら変換候補にする。
+3. 候補ごとに、条件式と前後のコードを LLM（Claude）に渡して「この条件が意図している自然言語の問い」を生成させる。チェーン全体が同じ変数を見ているなら `fuzzy_match()` に、単独なら `fuzzy()` に変換する。
+4. diff を出力する。
 5. 変換前後で同じテストデータを流し、判定の一致率を報告する。
 
-### 初版のモジュール設計が効く点
+### 未解決の論点
 
-- `fuzzy()` の第1引数が質問文、第2引数がテキスト、という単純な形にしてあるので、AST での書き換えが機械的にできる。
-- `mock()` があるので、変換後のコードのテストが API なしで書ける。
-- `prob()` があるので、一致率レポートでしきい値の調整ができる。
+- 変数が文字列かどうかは静的に分からない。型ヒントがあるものだけ対象にするか、実行時トレースを使うか。
+- `"エラー" in msg` を「不具合か」に変換すると、元コードが除外していたケース（「エラー」を含まない不具合報告）を含める意味の拡張になる。一致率が下がったときに変換を提案しない、という方針にするか。
+- 問いの生成に使う LLM とプロンプト。
+- `or` で繋がった条件を1つの問いにまとめるか、複数の `fuzzy()` の `or` にするか。
 
-### 未解決の論点（変換ツール着手時に決める）
-
-- 変換対象にする条件式のパターンをどこまで広げるか
-- 問いの生成に使う LLM とプロンプト
-- `or` で繋がった条件を1つの問いにまとめるか、複数の `fuzzy()` の `or` にするか
-
-## 10. 判断の記録
+## 11. 判断の記録
 
 | 論点 | 決定 | 理由 |
 |---|---|---|
-| 条件の形 | 自然言語の質問 | ユーザー選択。通常の if で書けない判定を可能にするのが目的 |
-| しきい値 | 既定 0.5、引数で上書き | ユーザー選択。単純で予測しやすい |
-| API 呼び出し | 1判定1呼び出し + キャッシュ | ユーザー選択。実装が単純で、elif は必要なときしか評価されないので無駄が少ない |
-| API 失敗時 | 既定は例外、`default` で抑制 | if の中で黙って False になると気づけない |
-| HTTP ライブラリ | 標準ライブラリ | 依存ゼロで導入しやすくする |
-| 非同期 | 初版では非対応 | 需要が見えてから |
-| 変換ツール | 初版では設計のみ | モジュールの API を固めてから着手する |
+| 条件の形 | 自然言語の質問 | ユーザー選択 |
+| しきい値 | 既定 0.5、引数で上書き | ユーザー選択 |
+| 排他分岐 | `fuzzy_match()` を入れる | レビュー指摘1。noul の if/elif は排他にならないことを実証 |
+| 複数判定 | `fuzzy_batch()` を入れる | レビュー指摘2。個別呼び出しは 2.4 倍の時間、2.6 倍のトークン |
+| キャッシュキー | model を含め、configure() でクリア | レビュー指摘3 |
+| HTTP | 標準ライブラリで keep-alive とリトライ | レビュー指摘4。接続確立が1回の56% |
+| mock の値 | float / dict / callable | レビュー指摘5 |
+| mock とキャッシュ | mock 中はキャッシュを触らない | レビュー指摘6 |
+| default の型 | prob は float、fuzzy は bool | レビュー指摘7 |
+| 空テキスト | ValueError | レビュー指摘8。API は空でも 200 を返す |
+| スレッド安全 | キャッシュに Lock、接続は threading.local | レビュー指摘9 |
+| API 失敗時 | 既定は例外 | レビューで覆す根拠なし |
+| 変換ツール | 設計のみ、未解決論点を追記 | レビュー指摘10 |
 
-## 11. 批判的レビューの結果と対応案（2026-09-19）
+## 12. 批判的レビューの記録（2026-09-19）
 
-subagent による敵対的検証。実 API を約15回叩いて実証済み。判定は「重大な課題あり」（確度高の Major 3件、確度中の Major 1件）。採否は未決定。
+subagent による敵対的検証。実 API を約15回叩いて実証。判定「重大な課題あり」。Major 4件と Minor 6件をすべて v0.2 に反映した。
 
-| # | 指摘 | 深刻度 | 確度 | 対応案 |
-|---|---|---|---|---|
-| 1 | if/elif は独立した noul の順次判定なので、複数が同時に threshold を超えると「先に書いた分岐」が勝ち、最も確からしい分岐にならない。実測: 「パスワードを変更したいのですができません」で bug=0.76, faq=0.89 | Major | 高 | `fuzzy_match()`（choice 型）を初版に含める。ドキュメントで「排他分岐は fuzzy_match、独立判定は fuzzy」と使い分けを明記 |
-| 2 | else 到達時は N 回直列呼び出し。実測: 3質問を個別に叩くと 2.42秒 / 884 tokens、1回にまとめると 0.97秒 / 332 tokens | Major | 高 | 対応案1で排他分岐が1回になれば大半は解消。独立判定を複数並べる場合向けに `fuzzy_batch(text, [q1, q2, ...]) -> list[float]` を追加 |
-| 3 | キャッシュキーが (question, text) のみで model / base_url を含まない。configure() 後も旧値が返る | Major | 中 | configure() 呼び出し時にキャッシュを全クリア。キーに model を含める |
-| 4 | urllib.request は接続を再利用せず、1呼び出しの56%が TCP+TLS 確立。リトライ方針も未記述 | Major | 高 | http.client.HTTPSConnection を保持して keep-alive。5xx/429/接続失敗は指数バックオフで最大3回リトライ。標準ライブラリのみは維持 |
-| 5 | mock の mapping が質問文のみをキーにし text を無視するため、elif の2番目以降や else に落ちるテストが1ブロックで書けない | Minor | 中 | mapping の値に「確率」または「text -> 確率 の辞書」または「callable(text) -> 確率」を許す |
-| 6 | mock の結果がキャッシュに残るか、mock 中にキャッシュが先に返るかが未定義 | Minor | 中 | mock 有効中はキャッシュを読まず書かない、と明記 |
-| 7 | prob() の default の型が未定義。fuzzy() が bool の default を prob() に渡す実装になりうる | Minor | 中 | prob(default: float or None)、fuzzy(default: bool or None) と分け、fuzzy は prob の APIError を捕まえて default を返す |
-| 8 | text="" でも API は 200 と確率（0.37）を返す。空のまま分岐に到達しても気づけない | Minor | 高 | text が空または空白のみなら ValueError |
-| 9 | configure() のグローバル状態とキャッシュのスレッド安全性が未記述 | Minor | 低 | キャッシュに threading.Lock。configure() は起動時に1回呼ぶ前提と明記 |
-| 10 | 第9章の AST 検出は変数の型が静的に分からず、「"エラー" in msg」→「不具合か」の変換は元コードが除外していたケースを含める意味拡張になる | Minor | 低 | 第9章の未解決論点に追加。変換は「提案」止まりで人が承認、という方針は維持 |
+検証したが成立しなかった仮説:
 
-### 検証したが成立しなかった仮説
-
-- 非決定性: 同一リクエスト3回で noul=0.95 が3回一致。出力は安定
-- 既定 default=None（例外）: 例外にも default=False にも破綻シナリオがあり、覆す根拠なし
-- threshold=0.5: 境界付近のケース（0.52）は実在したが、どの固定値でも境界は存在する。指摘1が本質
-- TLS 検証・プロキシ: urllib.request の既定で足りる
+- 非決定性: 同一リクエスト3回で 0.95 が3回一致
+- 既定を例外にする判断: 例外にも default=False にも破綻シナリオがあり、覆す根拠なし
+- しきい値 0.5: 境界付近のケースは実在するが、どの固定値でも境界はある
+- TLS 検証・プロキシ: `http.client` の既定で足りる
