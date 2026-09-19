@@ -53,7 +53,7 @@ if fuzzy("Is this a bug report?", msg):
     open_ticket(msg)
 
 # the probability behind it
-p = prob("Is this a bug report?", msg)          # 0.97
+p = prob("Is this a bug report?", msg)          # 0.0 .. 1.0
 
 # one label out of several, in a single request
 kind = fuzzy_match(msg, {
@@ -66,7 +66,7 @@ kind = fuzzy_match(msg, {
 p_urgent, p_angry = fuzzy_batch(msg, ["Is it urgent?", "Is the writer angry?"])
 
 # a position on an ordered scale (0 = first level)
-anger = fuzzy_score(msg, "How angry is the writer?", ["calm", "annoyed", "furious"])   # 0.4
+anger = fuzzy_score(msg, "How angry is the writer?", ["calm", "annoyed", "furious"])   # 0 .. 2
 ```
 
 ### `fuzzy` or `fuzzy_match`?
