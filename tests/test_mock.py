@@ -1,6 +1,6 @@
 import pytest
 
-from fuzzyif import mock as m
+from fuzzyif import _mock as m
 from fuzzyif.errors import MockMissError
 
 
